@@ -11,16 +11,16 @@
     "hint": "当检测到 QQ 空间登录失效时，自动清空已保存的 Cookies 并重新从 CQHTTP 获取登录态",
     "default": true
   },
-  "send_feedback": {
-    "description": "发送反馈",
-    "type": "bool",
-    "hint": "是否在执行操作时返回反馈信息",
-    "default": true
+  "feedback_session_id": {
+    "description": "回执会话 ID",
+    "type": "string",
+    "hint": "AI 操作空间后，把回执发到这个会话，而不是当前聊天。格式为 平台实例ID:消息类型:会话ID，例如 珂夜QQ:FriendMessage:123456 或 珂夜QQ:GroupMessage:群号。平台实例ID以消息平台配置为准，不一定是 aiocqhttp。留空则静默执行，不发送回执",
+    "default": ""
   },
   "analyze_images_on_view_feed": {
     "description": "查看说说时分析图片",
     "type": "bool",
-    "hint": "开启后，查看说说/LLM 查看说说时，如果说说包含图片，会调用视觉模型分析图片并把结果追加到返回内容中",
+    "hint": "开启后，查看说说时把图片注入当前对话，让模型直接看图。当前对话模型需要支持图片输入。若无法注入，再调用下方视觉模型把图片转成文字",
     "default": false
   },
   "vision_provider_id": {

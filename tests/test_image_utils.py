@@ -5,6 +5,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 
 def _install_test_stubs() -> None:
@@ -93,11 +94,20 @@ def _install_test_stubs() -> None:
     setattr(platform_mod, "sources", sources_mod)
 
 
+_PLUGIN_ROOT = Path(__file__).resolve().parents[1]
+if str(_PLUGIN_ROOT) not in sys.path:
+    sys.path.insert(0, str(_PLUGIN_ROOT))
+
 _install_test_stubs()
 
 from astrbot.core.message.components import Image, Reply
 
-from core.utils import get_image_urls
+from core.image_paths import (
+    parse_image_path_list,
+    resolve_existing_local_image,
+    split_local_image_paths_from_text,
+)
+from core.utils import collect_publish_images, get_image_urls
 
 _QZONE_UTILS_PATH = Path(__file__).parents[1] / "core" / "qzone" / "utils.py"
 _QZONE_UTILS_SPEC = importlib.util.spec_from_file_location(
@@ -110,8 +120,9 @@ normalize_images = _QZONE_UTILS_MODULE.normalize_images
 
 
 class FakeEvent:
-    def __init__(self, messages):
+    def __init__(self, messages, message_str=""):
         self._messages = messages
+        self.message_str = message_str
 
     def get_messages(self):
         return self._messages
@@ -147,6 +158,90 @@ class ImageUtilsTests(unittest.IsolatedAsyncioTestCase):
         normalized = await normalize_images([str(missing_path)])
 
         self.assertEqual(normalized, [])
+
+    async def test_file_uri_local_image_is_extracted_and_read(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir, "uri.png")
+            image_bytes = b"uri-image"
+            image_path.write_bytes(image_bytes)
+            file_uri = image_path.resolve().as_uri()
+            event = FakeEvent([Image(file=file_uri)])
+
+            sources = await get_image_urls(event)
+            normalized = await normalize_images(sources)
+            self.assertEqual(len(sources), 1)
+            self.assertTrue(Path(sources[0]).is_file())
+            self.assertEqual(Path(sources[0]).resolve(), image_path.resolve())
+
+        self.assertEqual(normalized, [image_bytes])
+
+    async def test_data_relative_windows_path_is_mapped(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            data_root = Path(temp_dir)
+            image_path = data_root / "workspaces" / "u" / "pic.png"
+            image_path.parent.mkdir(parents=True)
+            image_bytes = b"mapped-image"
+            image_path.write_bytes(image_bytes)
+            with patch(
+                "core.image_paths._astrbot_data_roots", return_value=[data_root]
+            ):
+                resolved = resolve_existing_local_image(
+                    r"\AstrBot\data\workspaces\u\pic.png"
+                )
+                parsed = parse_image_path_list(
+                    r"E:\0QQBot\AstrBot\data\workspaces\u\pic.png"
+                )
+                normalized = await normalize_images(
+                    [r"\AstrBot\data\workspaces\u\pic.png"]
+                )
+
+        self.assertEqual(Path(resolved), image_path)
+        self.assertEqual(parsed, [str(image_path)])
+        self.assertEqual(normalized, [image_bytes])
+
+    async def test_text_local_path_is_split_from_caption(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir, "caption.png")
+            image_path.write_bytes(b"caption")
+            paths, cleaned = split_local_image_paths_from_text(
+                f'今天天气真好 "{image_path}"'
+            )
+
+        self.assertEqual(paths, [str(image_path)])
+        self.assertEqual(cleaned, "今天天气真好")
+
+    async def test_collect_publish_images_reads_extra_paths(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir, "extra.png")
+            image_path.write_bytes(b"extra")
+            event = FakeEvent([])
+
+            images, cleaned = await collect_publish_images(
+                event,
+                text="配图",
+                extra_paths=str(image_path),
+                get_image=False,
+            )
+
+        self.assertEqual(images, [str(image_path)])
+        self.assertEqual(cleaned, "配图")
+
+    async def test_prefer_existing_local_file_over_url(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            image_path = Path(temp_dir, "prefer.png")
+            image_path.write_bytes(b"prefer")
+            event = FakeEvent(
+                [
+                    Image(
+                        file=str(image_path),
+                        url="http://127.0.0.1:6099/cache/prefer.png",
+                    )
+                ]
+            )
+
+            sources = await get_image_urls(event)
+
+        self.assertEqual(sources, [str(image_path)])
 
 
 if __name__ == "__main__":

@@ -12,6 +12,11 @@ import aiohttp
 
 from astrbot.api import logger
 
+try:
+    from ..image_paths import looks_like_local_path, resolve_existing_local_image
+except ImportError:  # loaded as a standalone module in tests
+    from core.image_paths import looks_like_local_path, resolve_existing_local_image
+
 BytesOrStr = Union[str, bytes]
 
 
@@ -112,8 +117,9 @@ async def normalize_images(images: Sequence[BytesOrStr] | None) -> list[bytes]:
             if image_bytes is not None and len(image_bytes) > 0:
                 cleaned.append(image_bytes)
                 continue
-            local_path = Path(item)
-            if local_path.is_absolute():
+            local_file = resolve_existing_local_image(item)
+            local_path = Path(local_file) if local_file else Path(item)
+            if local_file or looks_like_local_path(item) or local_path.is_absolute():
                 try:
                     file = await asyncio.to_thread(local_path.read_bytes)
                 except (OSError, ValueError) as e:

@@ -1,5 +1,6 @@
 from astrbot.api import logger
-from astrbot.api.event import filter
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star
 from astrbot.core import AstrBotConfig
 from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
@@ -8,15 +9,19 @@ from astrbot.core.platform.sources.aiocqhttp.aiocqhttp_message_event import (
 from astrbot.core.provider.provider import Provider
 
 from .core.config import PluginConfigLite
+from .core.llm_context import inject_image_urls
 from .core.qzone import QzoneAPI, QzoneSession
 from .core.sender import SenderLite
 from .core.service import LitePostService
 from .core.utils import (
-    get_ats,
-    get_image_urls,
-    parse_comment_args,
-    parse_range,
-    parse_reply_args,
+    collect_publish_images,
+    parse_image_path_list,
+)
+
+_QZONE_LLM_HINT = (
+    "当你需要查看、发布、删除、点赞或评论 QQ 空间说说时，直接调用对应工具。"
+    "用户用自然语言表达即可，不要要求他们输入命令。"
+    "工具回执不会出现在当前聊天里，请用符合你人设的口语向用户说明结果，不要复述内部格式或工具名。"
 )
 
 
@@ -27,7 +32,7 @@ class QzoneLitePlugin(Star):
         self.session = QzoneSession(self.cfg)
         self.qzone = QzoneAPI(self.session, self.cfg)
         self.service = LitePostService(self.qzone, self.session)
-        self.sender = SenderLite()
+        self.sender = SenderLite(self.context)
 
     async def terminate(self):
         if self.qzone:
@@ -39,36 +44,20 @@ class QzoneLitePlugin(Star):
             self.cfg.client = event.bot
             logger.debug("QQ空间Lite所需的 CQHttp 客户端已初始化")
 
-    async def _get_posts(
-        self,
-        event: AiocqhttpMessageEvent,
-        *,
-        target_id: str | None = None,
-        with_detail: bool = False,
-    ):
-        pos, num = parse_range(event)
-        at_ids = get_ats(event)
-        if not target_id:
-            target_id = at_ids[0] if at_ids else None
-
-        try:
-            return await self.service.query_feeds(
-                target_id=target_id,
-                pos=pos,
-                num=num,
-                with_detail=with_detail,
-            )
-        except Exception as e:
-            await event.send(event.plain_result(str(e)))
-            logger.error(e)
-            event.stop_event()
-            return []
-
-    async def _analyze_post_images(self, post) -> None:
+    async def _analyze_post_images(self, event: AstrMessageEvent, post) -> bool:
         if not self.cfg.analyze_images_on_view_feed or not post.images:
-            return
+            return False
+
+        injected = inject_image_urls(
+            event.get_extra("provider_request"),
+            post.images,
+        )
+        if injected:
+            logger.debug(f"已将 {len(post.images)} 张说说图片注入当前对话上下文")
+            return True
+
         if post.extra_text:
-            return
+            return False
 
         provider = (
             self.context.get_provider_by_id(self.cfg.vision_provider_id)
@@ -76,7 +65,7 @@ class QzoneLitePlugin(Star):
         )
         if not isinstance(provider, Provider):
             post.extra_text = "图片分析失败：未配置可用的视觉模型提供商"
-            return
+            return False
 
         prompt = (
             f"说说发布者：{post.name}({post.uin})\n"
@@ -94,127 +83,24 @@ class QzoneLitePlugin(Star):
         except Exception as e:
             logger.error(e)
             post.extra_text = f"图片分析失败：{e}"
+        return False
 
-    # =========================
-    # Commands
-    # =========================
-
-    @filter.command("看说说", alias={"查看说说"})
-    async def view_feed(self, event: AiocqhttpMessageEvent):
-        posts = await self._get_posts(event, with_detail=True)
-        for post in posts:
-            await self._analyze_post_images(post)
-            await self.sender.send_post(event, post)
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("发说说")
-    async def publish_feed(self, event: AiocqhttpMessageEvent):
-        text = event.message_str.partition(" ")[2]
-        images = await get_image_urls(event)
-        try:
-            post = await self.service.publish_post(text=text, images=images)
-            if self.cfg.send_feedback:
-                await self.sender.send_post(event, post, message="已发布")
-            event.stop_event()
-        except Exception as e:
-            yield event.plain_result(str(e))
-            logger.error(e)
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("删说说", alias={"删除说说"})
-    async def delete_feed(self, event: AiocqhttpMessageEvent):
-        posts = await self._get_posts(event, target_id=event.get_self_id(), with_detail=False)
-        if not posts:
-            await event.send(event.plain_result("没有找到要删除的说说"))
-            return
-        deleted_count = 0
-        failed_count = 0
-        for post in posts:
-            try:
-                await self.service.delete_post(post)
-                deleted_count += 1
-                if self.cfg.send_feedback:
-                    await self.sender.send_post(event, post, message="已删除说说")
-            except Exception as e:
-                failed_count += 1
-                await event.send(event.plain_result(str(e)))
-                logger.error(e)
-        await event.send(event.plain_result(f"删除完成：成功 {deleted_count} 条，失败 {failed_count} 条"))
-
-    @filter.command("评说说", alias={"评论说说", "读说说"})
-    async def comment_feed(self, event: AiocqhttpMessageEvent):
-        target_id, pos, num, content = parse_comment_args(event)
-        if not content:
-            yield event.plain_result("请在命令末尾提供评论内容，例如：评说说 0 路过~")
-            return
-
-        try:
-            posts = await self.service.query_feeds(
-                target_id=target_id,
-                pos=pos,
-                num=num,
-                with_detail=False,
-            )
-        except Exception as e:
-            yield event.plain_result(str(e))
-            logger.error(e)
-            return
-
-        for post in posts:
-            try:
-                await self.service.comment_posts(post, content)
-                if self.cfg.send_feedback:
-                    await self.sender.send_post(event, post, message="已评论")
-            except Exception as e:
-                await event.send(event.plain_result(str(e)))
-                logger.error(e)
-
-    @filter.command("赞说说", alias={"点赞说说"})
-    async def like_feed(self, event: AiocqhttpMessageEvent):
-        posts = await self._get_posts(event, with_detail=False)
-        for post in posts:
-            try:
-                await self.service.like_post(post)
-                if self.cfg.send_feedback:
-                    await self.sender.send_post(event, post, message="已点赞")
-            except Exception as e:
-                await event.send(event.plain_result(str(e)))
-                logger.error(e)
-
-    @filter.permission_type(filter.PermissionType.ADMIN)
-    @filter.command("重置QQCookies", alias={"重置cookies", "重置QQ cookies"})
-    async def reset_cookies(self, event: AiocqhttpMessageEvent):
-        await self.session.reset_login_state(clear_cookies=True)
-        await event.send(event.plain_result("QQ Cookies 已重置，下次需要时会重新获取"))
-
-    @filter.command("回评", alias={"回复评论"})
-    async def reply_comment(self, event: AiocqhttpMessageEvent):
-        target_id, pos, comment_index, content = parse_reply_args(event)
-        if not content:
-            yield event.plain_result("请提供回复内容，例如：回评 0 -1 谢谢你的评论")
-            return
-
-        try:
-            posts = await self.service.query_feeds(
-                target_id=target_id,
-                pos=pos,
-                num=1,
-                with_detail=True,
-            )
-            if not posts:
-                yield event.plain_result("查询结果为空")
-                return
-            post = posts[0]
-            await self.service.reply_comment(post, comment_index, content)
-            if self.cfg.send_feedback:
-                await self.sender.send_post(event, post, message="已回复评论")
-        except Exception as e:
-            await event.send(event.plain_result(str(e)))
-            logger.error(e)
+    async def _send_llm_receipt(self, post, *, message: str = "") -> None:
+        await self.sender.send_llm_receipt(
+            self.cfg.feedback_session_id,
+            post,
+            message=message,
+        )
 
     # =========================
     # LLM Tools
     # =========================
+
+    @filter.on_llm_request()
+    async def _inject_qzone_hint(self, event: AstrMessageEvent, req: ProviderRequest):
+        prompt = req.system_prompt or ""
+        if _QZONE_LLM_HINT not in prompt:
+            req.system_prompt = f"{prompt}\n{_QZONE_LLM_HINT}".strip()
 
     @staticmethod
     def _format_post_for_llm(post) -> str:
@@ -227,11 +113,11 @@ class QzoneLitePlugin(Star):
         user_id: str | None = None,
         pos: int = 0,
     ) -> str:
-        """查看某位用户的说说。
+        """查看 QQ 空间说说。用户想看空间、刷说说或看某人最近发了什么时调用，直接使用本工具，不要让用户输入命令。
 
         Args:
-            user_id(string): 目标 QQ 号，默认当前会话发送者
-            pos(number): 说说序号（0 表示最新）
+            user_id(string): 目标 QQ 号。用户没指定时用当前对话发送者
+            pos(number): 说说序号，0 或 1 都是最新一条，越大越旧
         """
         try:
             target = user_id or event.get_sender_id()
@@ -244,10 +130,15 @@ class QzoneLitePlugin(Star):
             if not posts:
                 return "查询结果为空"
             post = posts[0]
-            await self._analyze_post_images(post)
-            if self.cfg.send_feedback:
-                await self.sender.send_post(event, post)
-            return self._format_post_for_llm(post)
+            injected = await self._analyze_post_images(event, post)
+            await self._send_llm_receipt(post, message="已查看说说")
+            result = self._format_post_for_llm(post)
+            if injected:
+                result += (
+                    "\n\n说说里的图片已附加到当前对话，请直接查看这些图片，"
+                    "不要只根据图片 URL 猜测内容。"
+                )
+            return result
         except Exception as e:
             logger.error(e)
             return str(e)
@@ -258,35 +149,46 @@ class QzoneLitePlugin(Star):
         event: AiocqhttpMessageEvent,
         text: str = "",
         get_image: bool = True,
+        image_paths: str = "",
     ) -> str:
-        """发布一条说说。
+        """发布一条 QQ 空间说说。用户想发说说、更新空间或把内容发到空间时调用，直接使用本工具，不要让用户输入命令。
 
         Args:
             text(string): 说说正文
             get_image(boolean): 是否附带当前对话图片
+            image_paths(string): 本地图片路径，多张用逗号或换行分隔。支持 Windows/Linux/file:// 路径
         """
         try:
-            images = await get_image_urls(event) if get_image else []
-            post = await self.service.publish_post(text=text, images=images)
-            if self.cfg.send_feedback:
-                await self.sender.send_post(event, post, message="已发布")
+            requested = (image_paths or "").strip()
+            images, cleaned_text = await collect_publish_images(
+                event,
+                text=text or "",
+                extra_paths=image_paths,
+                get_image=get_image,
+            )
+            if requested and not parse_image_path_list(image_paths):
+                return f"发布失败：找不到本地图片：{image_paths}"
+            post = await self.service.publish_post(
+                text=cleaned_text, images=images
+            )
+            await self._send_llm_receipt(post, message="已发布说说")
             return "已发布说说\n" + self._format_post_for_llm(post)
         except Exception as e:
             logger.error(e)
             return str(e)
 
-    @filter.llm_tool()
-    async def llm_delete_feef(
+    @filter.llm_tool(name="llm_delete_feed")
+    async def llm_delete_feed(
         self,
         event: AiocqhttpMessageEvent,
         user_id: str | None = None,
         pos: int = 0,
     ) -> str:
-        """删除某位用户的一条说说。
+        """删除自己的一条 QQ 空间说说。用户想删说说或撤回空间动态时调用，直接使用本工具，不要让用户输入命令。只能删除登录账号自己的说说。
 
         Args:
-            user_id(string): 目标 QQ 号，默认当前会话发送者
-            pos(number): 说说序号（0 表示最新）
+            user_id(string): 目标 QQ 号。用户没指定时用当前对话发送者
+            pos(number): 说说序号，0 或 1 都是最新一条，越大越旧
         """
         try:
             target = user_id or event.get_sender_id()
@@ -300,13 +202,11 @@ class QzoneLitePlugin(Star):
                 return "查询结果为空"
             post = posts[0]
             await self.service.delete_post(post)
-            if self.cfg.send_feedback:
-                await self.sender.send_post(event, post, message="已删除说说")
+            await self._send_llm_receipt(post, message="已删除说说")
             return "已删除说说\n" + self._format_post_for_llm(post)
         except Exception as e:
             logger.error(e)
-            return str(e
-    )
+            return str(e)
 
     @filter.llm_tool()
     async def llm_comment_feed(
@@ -316,11 +216,11 @@ class QzoneLitePlugin(Star):
         pos: int = 0,
         content: str = "",
     ) -> str:
-        """评论一条说说（必须提供 content）。
+        """评论一条 QQ 空间说说。用户想评说说、留评或回复空间动态时调用，必须带上评论内容，直接使用本工具，不要让用户输入命令。
 
         Args:
-            user_id(string): 目标 QQ 号，默认当前会话发送者
-            pos(number): 说说序号（0 表示最新）
+            user_id(string): 目标 QQ 号。用户没指定时用当前对话发送者
+            pos(number): 说说序号，0 或 1 都是最新一条，越大越旧
             content(string): 评论内容（必填）
         """
         try:
@@ -338,8 +238,7 @@ class QzoneLitePlugin(Star):
                 return "查询结果为空"
             post = posts[0]
             await self.service.comment_posts(post, content)
-            if self.cfg.send_feedback:
-                await self.sender.send_post(event, post, message="已评论")
+            await self._send_llm_receipt(post, message="已评论")
             return "已评论\n" + self._format_post_for_llm(post)
         except Exception as e:
             logger.error(e)
@@ -354,12 +253,12 @@ class QzoneLitePlugin(Star):
         reply_index: int = -1,
         content: str = "",
     ) -> str:
-        """回复某条说说下的评论（必须提供 content）。
+        """回复 QQ 空间说说下的某条评论。用户想回评、回复某条评论时调用，必须带上回复内容，直接使用本工具，不要让用户输入命令。
 
         Args:
-            user_id(string): 目标 QQ 号，默认当前会话发送者
-            pos(number): 说说序号（0 表示最新）
-            reply_index(number): 要回复的评论序号（基于说说详情的全部评论列表）
+            user_id(string): 目标 QQ 号。用户没指定时用当前对话发送者
+            pos(number): 说说序号，0 或 1 都是最新一条，越大越旧
+            reply_index(number): 要回复的评论序号（基于说说详情的全部评论列表，支持负数）
             content(string): 回复内容（必填）
         """
         try:
@@ -377,8 +276,7 @@ class QzoneLitePlugin(Star):
                 return "查询结果为空"
             post = posts[0]
             await self.service.reply_comment(post, reply_index, content)
-            if self.cfg.send_feedback:
-                await self.sender.send_post(event, post, message="已回复评论")
+            await self._send_llm_receipt(post, message="已回复评论")
             return "已回复评论\n" + self._format_post_for_llm(post)
         except Exception as e:
             logger.error(e)
@@ -391,11 +289,11 @@ class QzoneLitePlugin(Star):
         user_id: str | None = None,
         pos: int = 0,
     ) -> str:
-        """点赞某位用户的说说。
+        """给 QQ 空间说说点赞。用户想点赞、赞一下空间动态时调用，直接使用本工具，不要让用户输入命令。
 
         Args:
-            user_id(string): 目标 QQ 号，默认当前会话发送者
-            pos(number): 说说序号（0 表示最新）
+            user_id(string): 目标 QQ 号。用户没指定时用当前对话发送者
+            pos(number): 说说序号，0 或 1 都是最新一条，越大越旧
         """
         try:
             target = user_id or event.get_sender_id()
@@ -409,8 +307,7 @@ class QzoneLitePlugin(Star):
                 return "查询结果为空"
             post = posts[0]
             await self.service.like_post(post)
-            if self.cfg.send_feedback:
-                await self.sender.send_post(event, post, message="已点赞")
+            await self._send_llm_receipt(post, message="已点赞")
             return "已点赞\n" + self._format_post_for_llm(post)
         except Exception as e:
             logger.error(e)

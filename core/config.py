@@ -46,14 +46,23 @@ class ConfigNode:
                 continue
             logger.warning(f"[config:{self.__class__.__name__}] 缺少字段: {key}")
 
-    def __getattr__(self, key: str) -> Any:
-        if key in self._fields():
-            return self._data.get(key)
-
-        if key in self.__dict__:
-            return self.__dict__[key]
-
-        raise AttributeError(key)
+    def __getattribute__(self, key: str) -> Any:
+        # 配置字段优先读 _data。带类默认值时不能走 __getattr__，
+        # 否则会一直拿到类属性，WebUI 里改过的值等于没生效。
+        if not key.startswith("_"):
+            try:
+                data = object.__getattribute__(self, "_data")
+                fields = type(self)._fields()
+            except AttributeError:
+                return object.__getattribute__(self, key)
+            if key in fields:
+                if key in data and data[key] is not None:
+                    return data[key]
+                try:
+                    return object.__getattribute__(type(self), key)
+                except AttributeError:
+                    return None
+        return object.__getattribute__(self, key)
 
     def __setattr__(self, key: str, value: Any) -> None:
         if key in self._fields():
@@ -75,7 +84,7 @@ class ConfigNode:
 class PluginConfigLite(ConfigNode):
     cookies_str: str
     auto_reset_on_login_expired: bool = True
-    send_feedback: bool = True
+    feedback_session_id: str = ""
     analyze_images_on_view_feed: bool = False
     vision_provider_id: str = ""
     vision_prompt: str = (
@@ -96,8 +105,8 @@ class PluginConfigLite(ConfigNode):
         # 与 _conf_schema.json 对齐：缺失时写入默认值
         if self.auto_reset_on_login_expired is None:
             self.auto_reset_on_login_expired = True
-        if self.send_feedback is None:
-            self.send_feedback = True
+        if self.feedback_session_id is None:
+            self.feedback_session_id = ""
         if self.analyze_images_on_view_feed is None:
             self.analyze_images_on_view_feed = False
         if self.vision_provider_id is None:
